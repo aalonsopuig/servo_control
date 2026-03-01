@@ -13,7 +13,6 @@ This sketch is a standalone servo control experiment driven by 3 potentiometers:
   - A2: Acceleration a (deg/s^2)
 
 It implements a simple trapezoidal motion profile (ramp up / cruise / ramp down),
-WITHOUT reading any feedback potentiometer from the servo.
 
 Key idea:
 - The servo is commanded in small position steps, updated periodically.
