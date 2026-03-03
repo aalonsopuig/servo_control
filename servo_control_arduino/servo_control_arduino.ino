@@ -6,202 +6,319 @@ Author:       Alejandro Alonso Puig + ChatGPT
 License:      Apache 2.0 License
 -------------------------------------------------------------------------------
 Description:
-This sketch is a standalone servo control experiment driven by 3 potentiometers:
+
+Generic standalone servo controller driven by 3 potentiometers:
 
   - A0: Target position (0..180 deg)
-  - A1: Max speed v_max (deg/s)
-  - A2: Acceleration a (deg/s^2)
+  - A1: Vmax%  (1..100 %)  -> speed limit as % of SERVO_MAX_SPEED_DEGPS
+  - A2: Amax%  (1..100 %)  -> acceleration limit as % of ACCEL_MAX_DEGPS2
 
-It implements a simple trapezoidal motion profile (ramp up / cruise / ramp down),
+It implements a trapezoidal motion profile (ramp up / cruise / ramp down)
+by updating a "commanded reference" in small steps at a fixed rate.
 
-Key idea:
-- The servo is commanded in small position steps, updated periodically.
-- The step size is not fixed: it depends on a "virtual velocity" v (deg/s).
-- v ramps up using acceleration a, but is automatically limited so the motion
-  can still stop on time (using the classic stopping-distance rule).
+Key ideas:
 
-Printed to PC (USB Serial):
-  TargetDeg | CurrentCmdDeg | V_deg_s | A_deg_s2 | DistDeg | DeltaDeg | PWM_us
+- The servo receives a PWM command corresponding to the commanded reference angle.
+- The commanded reference does NOT jump instantly to the final target:
+  it evolves according to a speed limit and an acceleration limit.
+- The speed ramps up with acceleration, but is also constrained so the reference
+  can still stop in time (classic stopping-distance rule).
 
-Hardware notes:
-- Servo signal: SERVO_PIN (digital)
-- Potentiometers: standard 0..5V dividers, wiper to A0/A1/A2, ends to 5V and GND
-- Servo GND and Arduino GND MUST be common
+-------------------------------------------------------------------------------
+SERVO SPEED PARAMETER (IMPORTANT)
+
+This sketch uses one physical characterization parameter:
+
+    SERVO_MAX_SPEED_DEGPS   [deg/s]
+
+It represents the *maximum real angular speed* the servo can achieve under the
+current supply voltage and load conditions.
+
+Example conversions from datasheet-style specs:
+
+  HS-805BB @6V
+  0.14 s / 60°  ->  60 / 0.14  = 428.6 deg/s
+
+  Futaba S3003 @4.8V
+  0.23 s / 60°  ->  60 / 0.23  = 261.0 deg/s  (DEFAULT USED HERE)
+
+If you change the servo model, the supply voltage, or mechanical conditions
+that affect speed, you MUST update SERVO_MAX_SPEED_DEGPS accordingly.
+
+-------------------------------------------------------------------------------
+USB SERIAL OUTPUT (printed each loop)
+
+Target | Cmd | V | V% | A% | Dist | dDeg | PWM
+
+- Target : target angle from the target potentiometer (deg)
+- Cmd    : commanded reference angle (deg) after motion profile update
+- V      : instantaneous profile velocity magnitude used for stepping (deg/s)
+- V%     : user knob for vmax limit (1..100%) of SERVO_MAX_SPEED_DEGPS
+- A%     : user knob for accel limit (1..100%) of ACCEL_MAX_DEGPS2
+- Dist   : remaining distance to target (deg), absolute value
+- dDeg   : step applied this tick (deg)
+- PWM    : microseconds sent to the servo (us)
+
 ===============================================================================
 */
 
 #include <Arduino.h>
 #include <Servo.h>
 
-// --------------------------- USER CONFIGURATION -----------------------------
+// ============================ USER CONFIGURATION ============================
 
-#define SERVO_PIN        9     // Servo PWM output pin
-#define POT_TARGET_PIN   A0    // Target position pot
-#define POT_VMAX_PIN     A1    // Max speed pot
-#define POT_ACCEL_PIN    A2    // Acceleration pot
+// ---- Pins ----
+// SERVO_PIN      : PWM output to servo signal wire
+// POT_TARGET_PIN : user knob for target angle (0..180°)
+// POT_VMAX_PIN   : user knob for vmax% (1..100%)
+// POT_ACCEL_PIN  : user knob for accel% (1..100%)
+#define SERVO_PIN        9
+#define POT_TARGET_PIN   A0
+#define POT_VMAX_PIN     A1
+#define POT_ACCEL_PIN    A2
 
-#define ADC_SCALE        1023.0f
-#define VREF             5.0f
+#define BAUDRATE         115200
 
-#define LOOP_INTERVAL_MS 40    // Control update period (ms) ~25 Hz
+// ---- Control loop timing ----
+// 20ms is a typical servo refresh frame; 40ms is fine too, but slower.
+// Keep it stable: the motion profile assumes a constant dt.
+#define LOOP_INTERVAL_MS 40
 
-// Servo PWM calibration (your HS-805BB real endpoints found experimentally)
+// ---- Servo PWM calibration ----
+// These define how the 0..180° command maps to microseconds.
+// Adjust to match YOUR servo endpoints safely.
 #define SERVO_CENTER_US  1500
-#define SERVO_SPAN_US     860   // +/- span around center for 0..180 mapping
+#define SERVO_HALFSPAN_US  860
 
-#define PWM_MIN_US       (SERVO_CENTER_US - SERVO_SPAN_US)  // 0 deg
-#define PWM_MAX_US       (SERVO_CENTER_US + SERVO_SPAN_US)  // 180 deg
+#define PWM_MIN_US       (SERVO_CENTER_US - SERVO_HALFSPAN_US)  // 0 deg
+#define PWM_MAX_US       (SERVO_CENTER_US + SERVO_HALFSPAN_US)  // 180 deg
 
-// Ranges for the pots -> motion parameters (tune as you like)
-#define VMAX_MIN_DPS     5.0f     // deg/s (slowest)
-#define VMAX_MAX_DPS     250.0f   // deg/s (fastest)
+// ---- Physical servo characterization ----
+// DEFAULT: Futaba S3003 @4.8V
+// 0.23 s / 60° -> 60 / 0.23 = 261 deg/s
+//
+// If you use another servo or change supply voltage, update this value.
+#define SERVO_MAX_SPEED_DEGPS 261.0f
 
-#define ACCEL_MIN_DPS2   20.0f    // deg/s^2 (gentle)
-#define ACCEL_MAX_DPS2   2000.0f  // deg/s^2 (aggressive)
+// ---- Acceleration reference (100% = this value) ----
+// This is a chosen design limit for acceleration used by the software profile.
+#define ACCEL_MAX_DEGPS2  800.0f
 
-// Small threshold to consider we reached the target (deg)
-#define EPS_DEG          0.25f
+// ---- Percent mapping ----
+#define PCT_MIN  1
+#define PCT_MAX  100
 
-// --------------------------- GLOBALS ----------------------------------------
+// ---- ADC ----
+#define ADC_SCALE  1023.0f
+
+// ---- Small threshold to consider we reached the target (deg) ----
+#define EPS_DEG    0.25f
+
+// ============================ GLOBAL STATE ==================================
 
 Servo s;
 
-static float currentCmdDeg = 0.0f;   // "virtual" commanded position we send to servo
-static float v_dps         = 0.0f;   // "virtual" velocity (deg/s) used to step the command
+// "Commanded reference" angle that we evolve smoothly (deg).
+// This is what we convert to PWM and send to the servo.
+static float cmdDeg = 0.0f;
 
-// --------------------------- HELPERS ----------------------------------------
+// Profile velocity magnitude (deg/s) used to step cmdDeg.
+// We keep it as a magnitude (>=0) and apply direction separately.
+static float vDegps = 0.0f;
 
+// ============================ HELPERS =======================================
+
+// Clamp float to [lo..hi].
 static inline float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
 }
 
+// Absolute value for float.
 static inline float absf(float x) { return (x >= 0.0f) ? x : -x; }
 
+// Map ADC 0..1023 to 0..1.
 static inline float map01(int adc) {
-  return (float)adc / ADC_SCALE;  // 0..1
+  return (float)adc / ADC_SCALE;
 }
 
-// Convert 0..180 degrees into PWM microseconds using your calibrated endpoints
+// Convert 0..180 degrees into PWM microseconds using calibrated endpoints.
 static inline int pwmUsFromDeg(float deg) {
   deg = clampf(deg, 0.0f, 180.0f);
   float us = PWM_MIN_US + (deg / 180.0f) * (PWM_MAX_US - PWM_MIN_US);
   return (int)(us + 0.5f);
 }
 
-// Read one pot and map to a float range
-float readPotMapped(uint8_t pin, float outMin, float outMax) {
-  int adc = analogRead(pin);                      // 0..1023
-  float x = map01(adc);                           // 0..1
-  return outMin + x * (outMax - outMin);          // linear map
-}
-
-// Read target pot and map to 0..180 degrees
+// Read target pot and map to 0..180 degrees.
 float readTargetDeg() {
   int adc = analogRead(POT_TARGET_PIN);
   float deg = map01(adc) * 180.0f;
   return clampf(deg, 0.0f, 180.0f);
 }
 
-// ---------------------------------------------------------------------------
-// SETUP
-// ---------------------------------------------------------------------------
-
-void setup() {
-  Serial.begin(115200);
-  delay(700);
-
-  s.attach(SERVO_PIN);  // We will always drive the servo with microseconds
-
-  // IMPORTANT: do NOT force 90 deg at startup.
-  // We start by reading the target pot and immediately commanding that position.
-  float targetDeg = readTargetDeg();
-  currentCmdDeg = targetDeg;
-  v_dps = 0.0f;
-
-  s.writeMicroseconds(pwmUsFromDeg(currentCmdDeg));
-
-  Serial.println("servo_control (target + v_max + accel)");
-  Serial.println("Target | CurrCmd | V(d/s) | A(d/s^2) | Dist | dDeg | PWM_us");
-  Serial.println("--------------------------------------------------------------");
+// Map ADC (0..1023) to integer percent (1..100), using full knob travel.
+int percentFromAdc(int adc) {
+  float t = clampf(map01(adc), 0.0f, 1.0f);                         // 0..1
+  int pct = (int)(PCT_MIN + t * (PCT_MAX - PCT_MIN) + 0.5f);        // rounded
+  if (pct < PCT_MIN) pct = PCT_MIN;
+  if (pct > PCT_MAX) pct = PCT_MAX;
+  return pct;
 }
 
-// ---------------------------------------------------------------------------
-// LOOP
-// ---------------------------------------------------------------------------
+// Convert Vmax% to physical speed limit (deg/s) relative to REAL servo max.
+// 100% -> SERVO_MAX_SPEED_DEGPS
+//  1%  -> 0.01 * SERVO_MAX_SPEED_DEGPS
+float vmaxDegpsFromPercent(int vmaxPct) {
+  float t = (float)vmaxPct / 100.0f;
+  float v = SERVO_MAX_SPEED_DEGPS * t;
+  return clampf(v, SERVO_MAX_SPEED_DEGPS * 0.01f, SERVO_MAX_SPEED_DEGPS);
+}
+
+// Convert Amax% to acceleration limit (deg/s²) relative to ACCEL_MAX_DEGPS2.
+float accelDegps2FromPercent(int accelPct) {
+  float t = (float)accelPct / 100.0f;
+  float a = ACCEL_MAX_DEGPS2 * t;
+  return max(a, ACCEL_MAX_DEGPS2 * 0.01f);
+}
+
+// Fixed-width row printing so columns do not “dance” in Serial Monitor.
+void printRowFixed(float targetDeg,
+                   float cmdDeg,
+                   float vDegps,
+                   int vmaxPct,
+                   int accelPct,
+                   float distDeg,
+                   float deltaDeg,
+                   int pwmUs)
+{
+  char a[12], b[12], c[12], d[12], e[12];
+
+  // Target, Cmd, V, Dist -> width 6, 1 decimal
+  dtostrf(targetDeg, 6, 1, a);
+  dtostrf(cmdDeg,    6, 1, b);
+  dtostrf(vDegps,    6, 1, c);
+  dtostrf(distDeg,   6, 1, d);
+
+  // dDeg -> width 7, 3 decimals (a bit more precision for small steps)
+  dtostrf(deltaDeg,  7, 3, e);
+
+  // Target | Cmd | V | V% | A% | Dist | dDeg | PWM
+  Serial.print(a); Serial.print(" | ");
+  Serial.print(b); Serial.print(" | ");
+  Serial.print(c); Serial.print(" | ");
+
+  if (vmaxPct < 100) Serial.print(' ');
+  if (vmaxPct < 10)  Serial.print(' ');
+  Serial.print(vmaxPct); Serial.print("% | ");
+
+  if (accelPct < 100) Serial.print(' ');
+  if (accelPct < 10)  Serial.print(' ');
+  Serial.print(accelPct); Serial.print("% | ");
+
+  Serial.print(d); Serial.print(" | ");
+  Serial.print(e); Serial.print(" | ");
+
+  if (pwmUs < 1000) Serial.print(' ');
+  Serial.println(pwmUs);
+}
+
+// ============================ SETUP =========================================
+
+void setup() {
+
+  Serial.begin(BAUDRATE);
+  delay(700);
+
+  // Attach servo with calibrated min/max pulse limits.
+  // This makes writeMicroseconds safer by constraining output range.
+  s.attach(SERVO_PIN, PWM_MIN_US, PWM_MAX_US);
+
+  // Startup behaviour:
+  // Read the target pot and immediately command that position,
+  // so the servo does not jump to some arbitrary default (like 90°).
+  float targetDeg = readTargetDeg();
+  cmdDeg = targetDeg;
+  vDegps = 0.0f;
+
+  s.writeMicroseconds(pwmUsFromDeg(cmdDeg));
+
+  Serial.println("servo_control (Target + V% + A%)");
+  Serial.println("Target |   Cmd |     V |  V% |  A% |  Dist |   dDeg |  PWM");
+  Serial.println("----------------------------------------------------------------");
+}
+
+// ============================ LOOP ==========================================
 
 void loop() {
 
-  // 1) Timing
-  const float dt = (float)LOOP_INTERVAL_MS / 1000.0f;   // seconds per tick
+  // dt is constant because we run with a fixed delay at the end of loop.
+  const float dt = (float)LOOP_INTERVAL_MS / 1000.0f;
 
-  // 2) Read the three user knobs
-  float targetDeg = readTargetDeg();                                     // 0..180
-  float vMax_dps  = readPotMapped(POT_VMAX_PIN,  VMAX_MIN_DPS,  VMAX_MAX_DPS);
-  float a_dps2    = readPotMapped(POT_ACCEL_PIN, ACCEL_MIN_DPS2, ACCEL_MAX_DPS2);
+  // ---- Read user knobs ----
+  float targetDeg = readTargetDeg();                 // 0..180 deg
 
-  // 3) Compute remaining distance to target
-  float dist = targetDeg - currentCmdDeg;  // signed distance (deg)
-  float dabs = absf(dist);                 // absolute distance (deg)
+  int adcVmax   = analogRead(POT_VMAX_PIN);          // 0..1023
+  int adcAccel  = analogRead(POT_ACCEL_PIN);         // 0..1023
 
-  // 4) If very close, snap and stop (prevents endless tiny dithering)
+  int vmaxPct   = percentFromAdc(adcVmax);           // 1..100 %
+  int accelPct  = percentFromAdc(adcAccel);          // 1..100 %
+
+  float vmaxDegps   = vmaxDegpsFromPercent(vmaxPct); // deg/s
+  float accelDegps2 = accelDegps2FromPercent(accelPct); // deg/s²
+
+  // ---- Distance to target ----
+  float dist = targetDeg - cmdDeg;     // signed distance (deg)
+  float dabs = absf(dist);             // absolute distance (deg)
+
+  float deltaApplied = 0.0f;           // will print actual step used this tick
+
+  // ---- If close enough, snap to target and stop ----
   if (dabs <= EPS_DEG) {
-    currentCmdDeg = targetDeg;
-    v_dps = 0.0f;
+    cmdDeg = targetDeg;
+    vDegps = 0.0f;
+    deltaApplied = 0.0f;
   } else {
 
-    // 5) Determine motion direction (+1 or -1)
+    // Direction of motion (+1 or -1) based on sign of distance.
     float dir = (dist > 0.0f) ? 1.0f : -1.0f;
 
-    // 6) Ramp up velocity by acceleration
-    //    v = v + a * dt
-    v_dps += a_dps2 * dt;
+    // Compute the maximum velocity that still allows stopping within dabs.
+    // v_stop = sqrt(2 * a * d)
+    float vStop = sqrtf(2.0f * accelDegps2 * dabs);
 
-    // 7) Apply max speed limit from pot
-    if (v_dps > vMax_dps) v_dps = vMax_dps;
+    // Allowed speed is limited by:
+    // - user-selected vmaxDegps
+    // - stopping constraint vStop (shrinks as we approach the target)
+    float vAllowed = min(vmaxDegps, vStop);
 
-    // 8) Deceleration constraint using stopping-distance rule
-    //
-    //    To be able to stop within remaining distance dabs:
-    //       d_stop = v^2 / (2a)  <= dabs
-    //    Rearranged to max allowed velocity for that distance:
-    //       v_stop = sqrt(2*a*dabs)
-    //
-    //    If our current v exceeds v_stop, clamp it down (meaning: start braking).
-    //
-    float v_stop = sqrtf(2.0f * a_dps2 * dabs);
-    if (v_dps > v_stop) v_dps = v_stop;
+    // Ramp velocity magnitude upward by accel*dt (simple acceleration limiter).
+    // Note: deceleration is automatically produced because vAllowed decreases
+    // near target, forcing vDegps down to satisfy the stop constraint.
+    vDegps += accelDegps2 * dt;
 
-    // 9) Convert velocity into a position step for this tick
-    float delta = v_dps * dt;         // deg to advance this tick (always positive)
+    // Cap to allowed speed.
+    if (vDegps > vAllowed) vDegps = vAllowed;
 
-    // 10) Never step past the target (cap delta to remaining distance)
+    // Convert velocity to step for this tick.
+    float delta = vDegps * dt;         // always positive
+
+    // Never overshoot target.
     if (delta > dabs) delta = dabs;
 
-    // 11) Apply the step in the correct direction
-    currentCmdDeg += dir * delta;
+    // Apply step.
+    cmdDeg += dir * delta;
+
+    deltaApplied = delta;
   }
 
-  // 12) Send command to servo
-  int pwm_us = pwmUsFromDeg(currentCmdDeg);
-  s.writeMicroseconds(pwm_us);
+  // ---- Send command to servo ----
+  int pwmUs = pwmUsFromDeg(cmdDeg);
+  s.writeMicroseconds(pwmUs);
 
-  // 13) Print for observation (USB Serial)
-  Serial.print(targetDeg, 1); Serial.print(" | ");
-  Serial.print(currentCmdDeg, 1); Serial.print(" | ");
-  Serial.print(v_dps, 1); Serial.print(" | ");
-  Serial.print(a_dps2, 0); Serial.print(" | ");
-  Serial.print(dabs, 1); Serial.print(" | ");
+  // ---- Telemetry (aligned columns) ----
+  printRowFixed(targetDeg, cmdDeg, vDegps, vmaxPct, accelPct, dabs, deltaApplied, pwmUs);
 
-  // DeltaDeg printed as the last applied step size (approx):
-  // We can recompute it cheaply for display by comparing to target:
-  // (Not exact when snapped, but good enough for debugging)
-  // Instead, let's print the theoretical step v*dt (bounded by distance):
-  float deltaPrint = clampf(v_dps * dt, 0.0f, dabs);
-  Serial.print(deltaPrint, 3); Serial.print(" | ");
-
-  Serial.println(pwm_us);
-
+  // Fixed loop period.
   delay(LOOP_INTERVAL_MS);
 }
