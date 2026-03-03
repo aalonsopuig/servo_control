@@ -1,14 +1,53 @@
 # servo_control
 
-This repository contains `servo_control`, an Arduino sketch designed to experimentally study servo motion shaping using incremental position commands and a configurable acceleration profile.
+This repository contains `servo_control`, an Arduino sketch for generic open-loop servo control using a trapezoidal motion profile and user-adjustable speed and acceleration limits expressed in percent.
 
-The program does not read the servo’s internal feedback potentiometer. It operates in open loop and generates PWM position commands while logging internal motion variables to the PC over USB. The objective is to observe how gradual reference updates influence perceived speed, smoothness and mechanical stress.
+The program does **not** read the servo’s internal feedback potentiometer. It operates purely in open loop, generating PWM position commands while logging internal motion variables to the PC over USB.
+
+The sketch is intended as a generic and reusable motion-shaping controller for standard hobby servos.
+
+---
 
 ## Objective
 
-Instead of sending a single large step to the final target angle, the sketch progressively moves an internal command variable toward the target. The motion is governed by a trapezoidal profile defined by a target `angle (degrees)`, a maximum velocity `v_max (deg/s)`, and an acceleration `a (deg/s²)`.
+Instead of sending a single large step directly to the final target angle, the sketch progressively moves an internal commanded reference toward the target.
 
-This approach allows empirical exploration of how velocity limiting and acceleration shaping affect servo behavior.
+The motion is governed by a trapezoidal profile defined by:
+
+- Target angle (degrees)
+- Maximum velocity limit **V% (1–100%)**
+- Maximum acceleration limit **A% (1–100%)**
+
+Where:
+
+- `V%` is a percentage of the physical maximum servo speed (`SERVO_MAX_SPEED_DEGPS`)
+- `A%` is a percentage of a configurable acceleration reference (`ACCEL_MAX_DEGPS2`)
+
+The commanded reference is incrementally updated at a fixed rate. This produces smooth acceleration and deceleration of the commanded signal sent to the servo.
+
+---
+
+## Servo speed parameter (SERVO_MAX_SPEED_DEGPS)
+
+The sketch uses one physical characterization parameter: SERVO_MAX_SPEED_DEGPS (deg/s)
+
+
+It represents the maximum real angular speed of the servo under the current supply voltage and operating conditions.
+
+Example conversions from datasheet-style specifications:
+
+- HS-805BB @6V  
+  `0.14 s / 60°  →  60 / 0.14  = 428.6 deg/s`
+
+- Futaba S3003 @4.8V  
+  `0.23 s / 60°  →  60 / 0.23  = 261.0 deg/s`  
+  (Default value used in the sketch)
+
+If the servo model, supply voltage, or mechanical conditions change, this parameter must be updated.
+
+The Vmax potentiometer always spans 1–100% of this value, ensuring the full knob travel remains meaningful for any servo.
+
+---
 
 ## Hardware setup
 
@@ -16,60 +55,101 @@ An Arduino Uno (or compatible 5 V board), one standard RC servo, and three poten
 
 Connections:
 
-- Servo signal → D9 (configurable in the sketch as `SERVO_PIN`)  
-- Servo power → external 6 V supply recommended for high-torque servos  
-- Servo ground → supply ground  
-- Arduino ground → must be connected to the same ground as the servo supply  
+- Servo signal → `D9` (configurable as `SERVO_PIN`)
+- Servo power → external supply recommended
+- Servo ground → supply ground
+- Arduino ground → must be connected to the same ground as the servo supply
 
 Potentiometers:
 
-- Target position pot: ends to 5 V and GND, wiper to `A0`  
-- Maximum velocity pot: ends to 5 V and GND, wiper to `A1`  
-- Acceleration pot: ends to 5 V and GND, wiper to `A2`  
+- Target position → wiper to `A0`
+- Vmax% → wiper to `A1`
+- Amax% → wiper to `A2`
 
-High-torque servos should not be powered from the Arduino 5 V rail.
+All potentiometers should be wired as standard 0–5 V dividers (ends to 5 V and GND).
+
+High-current or high-torque servos should not be powered from the Arduino 5 V rail.
+
+---
 
 ## Control principle
 
-At a fixed interval (`LOOP_INTERVAL_MS`), the sketch reads the target angle from `A0` and maps it to 0–180°. It reads `v_max` and acceleration from `A1` and `A2`. It then updates an internal commanded position (`currentCmdDeg`) using a trapezoidal motion profile and converts the commanded angle to PWM microseconds before sending it to the servo.
+At a fixed interval (`LOOP_INTERVAL_MS`), the sketch:
 
-The trapezoidal profile works as follows. Velocity ramps up using `v = v + a·dt`. Velocity is limited by the maximum velocity set by the user. Velocity is further limited using the stopping-distance rule `v_stop = sqrt(2·a·distance)`, ensuring the motion can decelerate and stop exactly at the target. The commanded position is advanced by `delta = v·dt`.
+1. Reads the target angle from `A0` and maps it to 0–180°.
+2. Reads Vmax% (`A1`) and Amax% (`A2`) and maps them to integer percentages (1–100%).
+3. Converts percentages to physical limits:
+   - `vmaxDegps = SERVO_MAX_SPEED_DEGPS × (V% / 100)`
+   - `accelDegps2 = ACCEL_MAX_DEGPS2 × (A% / 100)`
+4. Computes the remaining distance to the target.
+5. Updates the commanded reference (`cmdDeg`) using a trapezoidal motion profile.
+6. Converts the commanded angle to calibrated PWM microseconds.
+7. Sends the PWM signal to the servo.
 
-This produces smooth acceleration and deceleration in the commanded reference.
+The trapezoidal profile uses:
+
+- Acceleration ramp: `v = v + a·dt`
+- Velocity limiting by `vmaxDegps`
+- Stopping constraint: `v_stop = sqrt(2·a·distance)`
+- Position update: `delta = v·dt`
+
+The stopping constraint guarantees that the commanded reference can always decelerate and stop exactly at the target.
+
+---
+
+## Startup behavior
+
+At power-up, the sketch reads the target potentiometer and immediately sets the commanded reference to that angle.
+
+This prevents an initial jump to an arbitrary default position.
+
+---
 
 ## Servo calibration
 
-For the HS-805BB servo used in testing, the real mechanical endpoints were measured experimentally as approximately:
+PWM calibration is defined by:
 
-- 0° → 1500 − 860 µs  
-- 180° → 1500 + 860 µs  
+- `SERVO_CENTER_US`
+- `SERVO_HALFSPAN_US`
 
-These values are implemented in the sketch and should be adjusted if a different servo is used.
+These define:
+
+- `PWM_MIN_US`
+- `PWM_MAX_US`
+
+They must be adjusted for the specific servo used to avoid mechanical overtravel or hard-stop impacts.
+
+---
 
 ## Serial output
 
-At each control update, the sketch prints one line to the USB serial port (115200 baud) including:
+At each control update (115200 baud over USB), the sketch prints aligned telemetry columns: Target | Cmd | V | V% | A% | Dist | dDeg | PWM
 
-- Target angle (deg)  
-- Current commanded angle (deg)  
-- Current virtual velocity (deg/s)  
-- Acceleration (deg/s²)  
-- Remaining distance to target (deg)  
-- Applied delta step (deg)  
-- PWM command (µs)  
 
-This allows correlation between motion parameters and observed mechanical behavior.
+Meaning:
 
-## Why reducing the update interval affects perceived speed
+- `Target` : target angle from potentiometer (deg)
+- `Cmd`    : commanded reference angle after profile update (deg)
+- `V`      : instantaneous profile velocity magnitude (deg/s)
+- `V%`     : speed limit knob (1–100%) of `SERVO_MAX_SPEED_DEGPS`
+- `A%`     : acceleration limit knob (1–100%) of `ACCEL_MAX_DEGPS2`
+- `Dist`   : remaining distance to target (deg)
+- `dDeg`   : step applied during this update (deg)
+- `PWM`    : PWM pulse width sent to the servo (µs)
 
-Two mechanisms are involved.
+The fixed-width formatting keeps columns aligned for easier logging and analysis.
 
-From the command generator perspective, the position increment per update is `delta = v·dt`. If the update interval is reduced while keeping velocity in deg/s constant, each individual step becomes smaller but occurs more frequently. In an ideal actuator, the average commanded angular velocity remains approximately constant.
+---
 
-However, real RC servos contain an internal closed-loop controller that behaves approximately like a proportional or PD system. The motor drive effort is proportional to the position error between the commanded pulse width and the internal feedback potentiometer.
+## Motion shaping and perceived speed
 
-When the commanded position is advanced in small increments, the instantaneous position error remains small. The internal controller therefore generates lower drive effort, the motor does not saturate at maximum speed, and the motion becomes smoother and slower on average.
+The position increment per update is: delta = v · dt
 
-In contrast, a single large jump in commanded angle creates a large internal error, driving the motor near maximum effort until the error decreases.
 
-Incremental command updates therefore exploit the intrinsic closed-loop behavior of the servo. By limiting the error presented to the internal controller, the sketch indirectly limits motor speed without modifying the servo electronics. This is the fundamental reason why discrete interpolation and ramp shaping provide usable speed control in standard hobby servos.
+If the update interval decreases while velocity in deg/s remains constant, each step becomes smaller but occurs more frequently. The average commanded angular velocity remains approximately constant in an ideal actuator.
+
+In real RC servos, the internal controller responds to position error between the commanded pulse width and the internal potentiometer. Smaller incremental updates tend to reduce instantaneous error, which typically results in smoother motion compared to a single large command step.
+
+By shaping the commanded reference with acceleration and velocity limits, the sketch provides practical speed control behavior without modifying the servo electronics.
+
+
