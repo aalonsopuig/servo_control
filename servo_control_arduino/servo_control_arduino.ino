@@ -87,8 +87,8 @@ Target | Cmd | V | V% | A% | Dist | dDeg | PWM
 // ---- Servo PWM calibration ----
 // These define how the 0..180° command maps to microseconds.
 // Adjust to match YOUR servo endpoints safely.
-#define SERVO_CENTER_US  1500
-#define SERVO_HALFSPAN_US  860
+#define SERVO_CENTER_US  1150
+#define SERVO_HALFSPAN_US  650
 
 #define PWM_MIN_US       (SERVO_CENTER_US - SERVO_HALFSPAN_US)  // 0 deg
 #define PWM_MAX_US       (SERVO_CENTER_US + SERVO_HALFSPAN_US)  // 180 deg
